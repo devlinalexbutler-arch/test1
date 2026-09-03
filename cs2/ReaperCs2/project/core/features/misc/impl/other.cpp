@@ -1,0 +1,548 @@
+#include <pch/pch.hpp>
+#include <utilities/memory/memory.hpp>
+#include <utilities/addresses/addresses.hpp>
+#include <utilities/logging/logging.hpp>
+#include <core/settings.hpp>
+#include <core/features/features.hpp>
+#include <protection/game_addresses.hpp>
+namespace features::misc {
+	namespace {
+		[[nodiscard]] bool valid_panorama_panel( c_ui_panel* panel )
+		{
+			if ( !panel )
+			{
+				return false;
+			}
+
+			const auto vtable = memory::safe_read<std::uintptr_t>(
+				reinterpret_cast<std::uintptr_t>( panel ) );
+			return vtable.has_value( ) && *vtable != 0;
+		}
+
+		[[nodiscard]] c_ui_panel* find_panorama_script_panel( c_ui_engine* ui_engine )
+		{
+			if ( addresses::globals::hud )
+			{
+				const auto hud = memory::safe_read<std::uintptr_t>( addresses::globals::hud ).value_or( 0 );
+				const auto panel = hud
+					? memory::safe_read<c_ui_panel*>( hud + 0x8 ).value_or( nullptr )
+					: nullptr;
+				if ( valid_panorama_panel( panel ) )
+				{
+					return panel;
+				}
+			}
+
+			if ( !ui_engine )
+			{
+				return nullptr;
+			}
+
+			const auto engine = reinterpret_cast<std::uintptr_t>( ui_engine );
+			const auto stack_depth = memory::safe_read<int32_t>(
+				engine + offsetof( c_ui_engine, m_panel_stack_depth ) ).value_or( 0 );
+			if ( stack_depth > 0 && stack_depth <= 63 )
+			{
+				for ( auto index = stack_depth - 1; index >= 0; --index )
+				{
+					const auto panel = memory::safe_read<c_ui_panel*>(
+						engine + offsetof( c_ui_engine, m_panel_stack ) +
+						static_cast<std::uintptr_t>( index ) * sizeof( c_ui_panel* ) ).value_or( nullptr );
+					if ( valid_panorama_panel( panel ) )
+					{
+						return panel;
+					}
+				}
+			}
+
+			const auto panels = memory::safe_read<std::uintptr_t>(
+				engine + offsetof( c_ui_engine, m_panels_array ) ).value_or( 0 );
+			const auto panel_count = memory::safe_read<int32_t>(
+				engine + offsetof( c_ui_engine, m_panel_count ) ).value_or( 0 );
+			if ( !panels || panel_count <= 0 || panel_count > 8192 )
+			{
+				return nullptr;
+			}
+
+			for ( auto index = panel_count - 1; index >= 0; --index )
+			{
+				const auto data = memory::safe_read<panel_data_t>(
+					panels + static_cast<std::uintptr_t>( index ) * sizeof( panel_data_t ) );
+				if ( data && valid_panorama_panel( data->m_panel ) )
+				{
+					return data->m_panel;
+				}
+			}
+
+			return nullptr;
+		}
+
+		[[nodiscard]] bool dispatch_match_accept_event( )
+		{
+			if ( !addresses::globals::panorama )
+			{
+				return false;
+			}
+
+			auto* panorama = reinterpret_cast<c_panorama_ui_engine*>( addresses::globals::panorama );
+			auto* ui_engine = panorama->get_ui_engine( );
+			auto* script_panel = find_panorama_script_panel( ui_engine );
+			if ( !ui_engine || !script_panel )
+			{
+				return false;
+			}
+
+			const auto engine = reinterpret_cast<std::uintptr_t>( ui_engine );
+			const auto vtable = memory::safe_read<std::uintptr_t>( engine );
+			const auto run_script = vtable ? memory::safe_read<std::uintptr_t>(
+				*vtable + 77 * sizeof( std::uintptr_t ) ) : std::nullopt;
+			const auto panorama_begin = addresses::modules::panorama;
+			const auto panorama_end = panorama_begin + memory::get_module_size( panorama_begin );
+			if ( !run_script || *run_script < panorama_begin || *run_script >= panorama_end )
+			{
+				return false;
+			}
+
+			static constexpr auto script =
+				"(function(){if(typeof LobbyAPI==='undefined')return;"
+				"var remaining=LobbyAPI.GetReadyTimeRemainingSeconds();"
+				"if(typeof remaining==='number'&&remaining>0)"
+				"LobbyAPI.SetLocalPlayerReady('accept');})();";
+			ui_engine->run_script( script_panel, script );
+			return true;
+		}
+
+		[[nodiscard]] std::string controller_name( std::uintptr_t controller )
+		{
+			if ( !controller )
+			{
+				return {};
+			}
+
+			const auto name_ptr = memory::safe_read<std::uintptr_t>(
+				controller + SCHEMA( "CCSPlayerController", "m_sSanitizedPlayerName"_hash ) ).value_or( 0 );
+			return memory::read_string( name_ptr, 127 );
+		}
+
+		void submit_name_change( const std::string& display_name )
+		{
+			if ( display_name.empty( ) )
+			{
+				return;
+			}
+
+			other::s_display_name = display_name;
+			other::s_name_change_pending = true;
+			memory::call<void>( PATTERN( patterns::engine_client_cmd ), addresses::globals::source2engine_to_client, 0, xs( "setinfo name x" ), 0x7ffef001 );
+			other::s_name_change_pending = false;
+		}
+
+	} // namespace
+
+	void other::on_round_start( )
+	{
+		this->do_autobuy( );
+	}
+
+	void other::on_auto_accept_timer( )
+	{
+		if ( !settings::g_misc.auto_accept.value )
+		{
+			return;
+		}
+
+		// ActionMatchmaking confirms that the current Panorama matchmaking action
+		// handler is present before touching the matchmaking Panorama API.
+		static const auto action_matchmaking = PATTERN( patterns::action_matchmaking );
+		if ( !action_matchmaking )
+		{
+			return;
+		}
+
+		(void)dispatch_match_accept_event( );
+	}
+
+	void other::on_player_death( std::uintptr_t event )
+	{
+		if ( !event )
+		{
+			return;
+		}
+
+		const auto attacker_key = cstypes::event_hash{ 0, "attacker" };
+		const auto attacker = memory::call<std::uintptr_t>( PATTERN (patterns::game_event_get_controller), event, &attacker_key );
+	}
+
+	void other::on_frame_stage_notify( )
+	{
+		this->do_player_alpha_changing( );
+		this->do_reveal_radar( );
+		this->do_name_changing( );
+		this->do_viewmodel_adjust( );
+	}
+
+	void other::do_reveal_radar( ) const
+	{
+		if ( !settings::g_misc.reveal_radar.value )
+		{
+			return;
+		}
+
+		const auto local = systems::g_local.get( );
+		if ( !local.is_valid( ) )
+		{
+			return;
+		}
+
+		auto spotted_state = SCHEMA( "C_CSPlayerPawn", "m_entitySpottedState"_hash );
+		if ( !spotted_state )
+		{
+			spotted_state = SCHEMA( "C_CSPlayerPawnBase", "m_entitySpottedState"_hash );
+		}
+
+		auto spotted_flag = SCHEMA( "EntitySpottedState_t", "m_bSpotted"_hash );
+		auto spotted_mask = SCHEMA( "EntitySpottedState_t", "m_bSpottedByMask"_hash );
+
+		// schema dump fallbacks — layout has been stable
+		if ( !spotted_flag )
+		{
+			spotted_flag = 0x8;
+		}
+		if ( !spotted_mask )
+		{
+			spotted_mask = 0xC;
+		}
+		if ( !spotted_state )
+		{
+			return;
+		}
+
+		const auto local_pawn = local.view_pawn( );
+
+		for ( const auto& player : systems::g_entities.get_by_type( systems::entities::type::player ) )
+		{
+			const auto controller = player.ptr;
+			if ( !controller || controller == local.view_controller( ) )
+			{
+				continue;
+			}
+
+			const auto alive = memory::safe_read<bool>( controller + SCHEMA( "CCSPlayerController", "m_bPawnIsAlive"_hash ) );
+			if ( !alive.value_or( false ) )
+			{
+				continue;
+			}
+
+			auto pawn_handle = memory::safe_read<std::uint32_t>( controller + SCHEMA( "CCSPlayerController", "m_hPlayerPawn"_hash ) ).value_or( 0 );
+			if ( !pawn_handle )
+			{
+				pawn_handle = memory::safe_read<std::uint32_t>( controller + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) ).value_or( 0 );
+			}
+
+			const auto pawn = systems::g_entities.lookup( pawn_handle );
+			if ( !pawn || pawn == local_pawn )
+			{
+				continue;
+			}
+
+			const auto team = memory::safe_read<int>( pawn + SCHEMA( "C_BaseEntity", "m_iTeamNum"_hash ) ).value_or( 0 );
+			if ( !local.is_this_other_team( team ) )
+			{
+				continue;
+			}
+
+			const auto state = pawn + spotted_state;
+			memory::safe_write<bool>( state + spotted_flag, true );
+			// radar checks the observer bit in this mask, not just m_bSpotted
+			memory::safe_write<std::uint32_t>( state + spotted_mask, 0xFFFFFFFFu );
+			memory::safe_write<std::uint32_t>( state + spotted_mask + 4, 0xFFFFFFFFu );
+		}
+	}
+
+	void other::do_autobuy( ) const
+	{
+		if ( !settings::g_misc.m_autobuy.enabled )
+		{
+			return;
+		}
+
+		std::string cmd {};
+
+		switch ( settings::g_misc.m_autobuy.primary_weapon )
+		{
+		case 1: cmd += xs( "buy ak47; buy m4a1; " ); break;
+		case 2: cmd += xs( "buy sg556; buy aug; " ); break;
+		case 3: cmd += xs( "buy ssg08; " ); break;
+		case 4: cmd += xs( "buy awp; " ); break;
+		case 5: cmd += xs( "buy g3sg1; buy scar20; " ); break;
+		}
+
+		if ( settings::g_misc.m_autobuy.armor )
+		{
+			cmd += xs( "buy vesthelm; buy vest; " );
+		}
+
+		if ( settings::g_misc.m_autobuy.taser )
+		{
+			cmd += xs( "buy taser; " );
+		}
+
+		if ( settings::g_misc.m_autobuy.defuser )
+		{
+			cmd += xs( "buy defuser; " );
+		}
+
+		switch ( settings::g_misc.m_autobuy.secondary_weapon )
+		{
+		case 1: cmd += xs( "buy elite; " ); break;
+		case 2: cmd += xs( "buy fiveseven; buy tec9; " ); break;
+		case 3: cmd += xs( "buy deagle; " ); break;
+		case 4: cmd += xs( "buy revolver; " ); break;
+		}
+
+		for ( auto i = 0; i < 5; ++i )
+		{
+			if ( !settings::g_misc.m_autobuy.grenades[ i ] )
+			{
+				continue;
+			}
+
+			switch ( i )
+			{
+			case 0: cmd += xs( "buy molotov; buy incgrenade; " ); break;
+			case 1: cmd += xs( "buy hegrenade; " ); break;
+			case 2: cmd += xs( "buy smokegrenade; " ); break;
+			case 3: cmd += xs( "buy flashbang; " ); break;
+			case 4: cmd += xs( "buy decoy; " ); break;
+			}
+		}
+
+		if ( !cmd.empty( ) )
+		{
+			memory::call<void>(PATTERN (patterns::engine_client_cmd), addresses::globals::source2engine_to_client, 0, cmd.c_str( ), 0x7ffef001 );
+		}
+	}
+
+	void other::do_player_alpha_changing( )
+	{
+		const auto local = systems::g_local.get( );
+
+		if ( !local.pawn || !local.is_alive )
+		{
+			if ( this->m_is_alpha_changed && local.pawn )
+			{
+				memory::call<void>( PATTERN (patterns::game_event_get_string), local.pawn, 255 );
+			}
+
+			this->m_is_alpha_changed = false;
+			return;
+		}
+
+		if ( !settings::g_esp.m_local_alpha.enabled.value )
+		{
+			if ( this->m_is_alpha_changed )
+			{
+				this->m_is_alpha_changed = false;
+				memory::call<void>( PATTERN (patterns::game_event_get_string), local.pawn, 255 );
+			}
+
+			return;
+		}
+
+		const auto is_scoped = memory::read<bool>( local.pawn + SCHEMA( "C_CSPlayerPawn", "m_bIsScoped"_hash ) );
+		const auto should_apply = !settings::g_esp.m_local_alpha.only_scoped.value || is_scoped;
+
+		if ( should_apply )
+		{
+			this->m_is_alpha_changed = true;
+			const auto alpha = static_cast< std::uint8_t >( settings::g_esp.m_local_alpha.opacity.value * 255.0f );
+			memory::call<void>( PATTERN (patterns::game_event_get_string), local.pawn, alpha );
+		}
+		else
+		{
+			if ( this->m_is_alpha_changed )
+			{
+				this->m_is_alpha_changed = false;
+				memory::call<void>( PATTERN (patterns::game_event_get_string), local.pawn, 255 );
+			}
+		}
+	}
+
+	void other::do_name_changing( )
+	{
+		const auto local = systems::g_local.get( );
+		const auto& cfg = settings::g_misc.m_name_changer;
+		const auto enabled = cfg.clantag.value || cfg.override_name.value;
+
+		if ( !enabled )
+		{
+			if ( this->m_name_changer_active && local.controller && !this->m_original_name.empty( ) )
+			{
+				submit_name_change( this->m_original_name );
+			}
+
+			this->m_name_changer_active = false;
+			this->m_name_changer_controller = 0;
+			this->m_original_name.clear( );
+			this->m_last_sent_name.clear( );
+			other::s_display_name.clear( );
+			return;
+		}
+
+		if ( !local.controller )
+		{
+			return;
+		}
+
+		if ( !this->m_name_changer_active )
+		{
+			this->m_original_name = controller_name( local.controller );
+			if ( this->m_original_name.empty( ) )
+			{
+				this->m_original_name = xs( "Player" );
+			}
+
+			this->m_name_changer_active = true;
+			this->m_name_changer_controller = local.controller;
+			this->m_last_sent_name.clear( );
+		}
+		else if ( this->m_name_changer_controller != local.controller )
+		{
+			// Keep the captured real name across map loads, where the controller may be recreated.
+			this->m_name_changer_controller = local.controller;
+			this->m_last_sent_name.clear( );
+		}
+
+		const auto& configured_name = cfg.name.value;
+		const auto& base_name = cfg.override_name.value && !configured_name.empty( )
+			? configured_name
+			: this->m_original_name;
+
+		std::string display_name = base_name;
+		if ( cfg.clantag.value )
+		{
+			constexpr std::string_view tag{ "KryptiK" };
+			constexpr auto ticks_per_step{ 16 }; // 0.25 seconds at CS2's 64-tick interval.
+			constexpr auto phase_count{ static_cast<int>( tag.size( ) * 2 ) };
+
+			const auto global_vars = memory::safe_read<std::uintptr_t>( addresses::globals::global_vars ).value_or( 0 );
+			const auto current_tick = global_vars
+				? memory::safe_read<int>( global_vars + 0x44 ).value_or( 0 )
+				: 0;
+			auto phase = current_tick / ticks_per_step % phase_count;
+			if ( phase < 0 )
+			{
+				phase += phase_count;
+			}
+
+			const auto reveal_index = phase <= static_cast<int>( tag.size( ) )
+				? phase
+				: phase_count - phase;
+			const auto visible_tag = tag.substr( 0, static_cast<std::size_t>( reveal_index ) );
+			if ( !visible_tag.empty( ) )
+			{
+				display_name.reserve( base_name.size( ) + visible_tag.size( ) + 3 );
+				display_name = "[";
+				display_name += visible_tag;
+				display_name += "] ";
+				display_name += base_name;
+			}
+		}
+		if ( display_name == this->m_last_sent_name )
+		{
+			return;
+		}
+
+		submit_name_change( display_name );
+		this->m_last_sent_name = std::move( display_name );
+	}
+
+	void other::do_kill_feed_preservation( )
+	{
+		const auto local = systems::g_local.get ();
+
+		if (!local.pawn || !local.is_alive) {
+			return;
+		}
+
+		const auto hud_element = memory::call<std::uintptr_t>(PATTERN (patterns::find_hud_element), xs( "CCSGO_HudDeathNotice" ) );
+		if ( !hud_element )
+		{
+			return;
+		}
+
+		memory::safe_write<float>( hud_element + 0x58, settings::g_misc.preserve_killfeed ? 1000.0f : 1.5f );
+
+		const auto spawn_off = SCHEMA( "C_CSPlayerPawnBase", "m_flLastSpawnTimeIndex"_hash );
+		if ( !spawn_off )
+		{
+			return;
+		}
+
+		const auto spawntime = memory::safe_read<float>( local.pawn + spawn_off ).value_or( this->m_last_spawntime );
+		if ( this->m_last_spawntime != spawntime )
+		{
+			const auto clear_death_notices = PATTERN( patterns::hud_death_notice_clear );
+			if ( clear_death_notices && hud_element > 0x20 )
+			{
+				memory::call<void>( clear_death_notices, hud_element - 0x20 );
+			}
+
+			this->m_last_spawntime = spawntime;
+		}
+	}
+
+	void other::do_viewmodel_adjust( )
+	{
+		const auto& cfg = settings::g_misc.m_viewmodel_adjust;
+		if ( !cfg.enabled.value )
+		{
+			this->m_cached_vm_x = std::numeric_limits<float>::quiet_NaN( );
+			this->m_cached_vm_y = std::numeric_limits<float>::quiet_NaN( );
+			this->m_cached_vm_z = std::numeric_limits<float>::quiet_NaN( );
+			this->m_cached_vm_fov = std::numeric_limits<float>::quiet_NaN( );
+			return;
+		}
+
+		const auto set_float_cvar = [ ]( std::uint32_t hash, float value )
+			{
+				if ( !addresses::globals::cvar )
+				{
+					return;
+				}
+
+				auto* cvar = addresses::globals::cvar->find( hash );
+				if ( !cvar )
+				{
+					return;
+				}
+
+				cvar->m_value.fl = value;
+			};
+
+		if ( cfg.offset_x.value != this->m_cached_vm_x )
+		{
+			set_float_cvar( "viewmodel_offset_x"_hash, cfg.offset_x.value );
+			this->m_cached_vm_x = cfg.offset_x.value;
+		}
+
+		if ( cfg.offset_y.value != this->m_cached_vm_y )
+		{
+			set_float_cvar( "viewmodel_offset_y"_hash, cfg.offset_y.value );
+			this->m_cached_vm_y = cfg.offset_y.value;
+		}
+
+		if ( cfg.offset_z.value != this->m_cached_vm_z )
+		{
+			set_float_cvar( "viewmodel_offset_z"_hash, cfg.offset_z.value );
+			this->m_cached_vm_z = cfg.offset_z.value;
+		}
+
+		if ( cfg.fov.value != this->m_cached_vm_fov )
+		{
+			set_float_cvar( "viewmodel_fov"_hash, cfg.fov.value );
+			this->m_cached_vm_fov = cfg.fov.value;
+		}
+	}
+
+} // namespace features::misc

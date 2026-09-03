@@ -1,0 +1,1185 @@
+// language: C++, file: legit.cpp, namespace: features::combat
+// round 4 — bug fixes + major improvements:
+//
+//   v3 fixes carried forward (1-16)
+//
+//   round 4 bug fixes:
+//  17. CRITICAL: remove set_view_angles from apply_rcs — was causing double-correction
+//      (view moved by set_view_angles, then mouse delta moved it again using stale angles)
+//      supplement is now accumulated into want_x/want_y instead
+//  18. pitch hard-clamp to ±89 after every correction (was missing — caused shoot-down)
+//  19. spike detection guard: only fires when shots_fired > 1 AND prev_punch was nonzero
+//      (was firing on first shot after idle because prev=0 and any punch > 0.8)
+//  20. want_x/want_y safety clamp ±12 degrees per tick (runaway prevention)
+//  21. apply_rcs simplified: no longer needs view_angles or local param
+//      (returns supplement via output pair instead of calling set_view_angles)
+//  22. remainder overflow reset: if |remainder| > 2 degrees, discard (broken accumulation)
+//  23. jitter disabled during heavy recoil (shots_fired > 4 and punch > 3 degrees)
+//      avoids micro-jitter compounding with RCS during spray
+//  24. smooth delta re-read is always consistent because set_view_angles is gone
+//  25. standalone RCS set_view_angles kept (only path, no aimbot conflict)
+
+#include <pch/pch.hpp>
+#include <utilities/memory/memory.hpp>
+#include <utilities/addresses/addresses.hpp>
+#include <utilities/random/random.hpp>
+#include <utilities/logging/logging.hpp>
+#include <core/systems/systems.hpp>
+#include <core/features/features.hpp>
+#include <protection/game_addresses.hpp>
+
+namespace features::combat {
+
+// ─── internal helpers ─────────────────────────────────────────────────────────
+
+static float lcg_float( std::uint32_t seed )
+{
+    seed ^= ( seed << 13 );
+    seed ^= ( seed >> 17 );
+    seed ^= ( seed << 5 );
+    return static_cast<float>( seed & 0xFFFFFF ) / static_cast<float>( 0xFFFFFF );
+}
+
+static float gaussian( float u1, float u2 )
+{
+    u1 = std::max( u1, 1e-7f );
+    return std::sqrtf( -2.0f * std::logf( u1 ) ) * std::cosf( 6.28318530f * u2 );
+}
+
+// FIX 18: pitch must be clamped to ±89, not just normalized.
+// normalize_angles wraps yaw to [-180,180] but doesn't clamp pitch.
+// Unclamped pitch beyond ±89 causes the engine to snap view straight down.
+static void clamp_angles( math::vector3& angles )
+{
+    math::helpers::normalize_angles( angles );
+    angles.x = std::clamp( angles.x, -89.0f, 89.0f );
+}
+
+// ─── on_create_move ──────────────────────────────────────────────────────────
+
+void legit::on_create_move( systems::input::usercmd* cmd )
+{
+    if ( !settings::g_combat.m_legitbot.enabled.value )
+        return;
+
+    auto& ctx = g_shared.ctx( );
+    if ( !ctx.valid )
+        return;
+
+    if ( ctx.weapon_type < cstypes::weapon_type::pistol ||
+         ctx.weapon_type > cstypes::weapon_type::lmg )
+        return;
+
+    const auto& config     = settings::g_combat.m_legitbot.get_group( ctx.weapon_type );
+    const auto view_angles = systems::g_input.get_view_angles( );
+    const auto local       = systems::g_local.get( );
+    const auto aim_punch   = g_shared.get_aim_punch( local.pawn );
+
+    this->m_cached_view_angles = view_angles;
+    this->m_cached_aim_punch   = aim_punch;
+    this->m_target             = {};
+
+    if ( !g_shared.can_shoot( cmd, local.controller, false ) )
+    {
+        this->m_remainder_x *= 0.6f;
+        this->m_remainder_y *= 0.6f;
+        if ( std::abs( this->m_remainder_x ) < 0.0005f ) this->m_remainder_x = 0.0f;
+        if ( std::abs( this->m_remainder_y ) < 0.0005f ) this->m_remainder_y = 0.0f;
+        this->m_prev_aim_punch = aim_punch;
+        this->m_old_punch      = aim_punch;
+        return;
+    }
+
+    auto shoot_position = g_shared.get_interpolated_shoot_position( local.pawn, false );
+    ctx.spread          = g_shared.get_spread( );
+    ctx.inaccuracy      = g_shared.get_inaccuracy( true );
+
+    systems::g_prediction.simulate( cmd, local, [ & ]
+    {
+        shoot_position = g_shared.get_interpolated_shoot_position( local.pawn, false );
+        ctx.spread     = g_shared.get_spread( );
+        ctx.inaccuracy = g_shared.get_inaccuracy( true );
+    } );
+
+    // Detection uses punch-compensated angles so the FOV circle tracks
+    // where the player is visually looking during recoil
+    auto detection_angles = view_angles;
+    if ( config.rcs.value && aim_punch.length_sqr( ) > 0.0001f )
+    {
+        detection_angles.x += aim_punch.x;
+        detection_angles.y += aim_punch.y;
+        clamp_angles( detection_angles );
+    }
+
+    if ( config.aimbot.value )
+    {
+        const auto prev_sticky = this->m_sticky_pawn;
+
+        this->m_target = this->find_target( shoot_position, detection_angles, config, local );
+
+        if ( this->m_target.has_target( ) )
+        {
+            if ( this->m_target.pawn != prev_sticky )
+                this->m_humanize_phase = 0.0f;
+
+            this->m_sticky_pawn  = this->m_target.pawn;
+            this->m_sticky_ticks = 8 + config.sticky.value / 8;
+        }
+        else if ( this->m_sticky_ticks > 0 )
+        {
+            --this->m_sticky_ticks;
+        }
+        else
+        {
+            this->m_sticky_pawn = 0;
+        }
+
+        // FIX 26: the top-level gate above uses can_shoot(..., false), which
+        // skips the next_attack timing check — that's intentional, it lets
+        // target detection and sticky-tracking continue smoothly through a
+        // reload so we're already locked the instant the weapon is ready.
+        // But moving the view is a different concern: if apply_aimbot runs
+        // while the weapon is mid-reload, the aim delta has no smoothing
+        // continuity from the previous tick (aim_punch/remainder were just
+        // reset to zero when reload started), so the tick the weapon becomes
+        // ready computes a big, unsmoothed jump — this is what sent the view
+        // straight up in the clip. Require the STRICT check (checks
+        // next_attack too) before moving.
+        if ( this->m_target.has_target( ) )
+            this->apply_aimbot( cmd, this->m_target, view_angles, aim_punch, config, local );
+    }
+
+    if ( !this->m_target.has_target( ) )
+    {
+        this->m_remainder_x *= 0.6f;
+        this->m_remainder_y *= 0.6f;
+        if ( std::abs( this->m_remainder_x ) < 0.0005f ) this->m_remainder_x = 0.0f;
+        if ( std::abs( this->m_remainder_y ) < 0.0005f ) this->m_remainder_y = 0.0f;
+    }
+
+    const auto locking = this->m_target.has_target( );
+    if ( !locking && ( config.standalone_rcs.value || config.rcs.value ) )
+    {
+        const auto strength = config.standalone_rcs.value
+            ? config.standalone_rcs_strength.value
+            : 100;
+        const auto rmin = config.standalone_rcs.value ? config.standalone_rcs_min.value : config.rcs_min.value;
+        const auto rmax = config.standalone_rcs.value ? config.standalone_rcs_max.value : config.rcs_max.value;
+        this->update_standalone_rcs( systems::g_input.get_view_angles( ), aim_punch, strength, rmin, rmax, true, local );
+    }
+
+    if ( !g_shared.can_shoot( cmd, local.controller ) )
+        return;
+
+    if ( config.triggerbot.value )
+        this->apply_triggerbot( cmd, shoot_position, view_angles, aim_punch, config, local );
+}
+
+// ─── on_render ────────────────────────────────────────────────────────────────
+
+void legit::on_render( xdraw::draw_list& draw_list )
+{
+    if ( !settings::g_combat.m_legitbot.enabled.value )
+        return;
+
+    const auto& ctx = g_shared.ctx( );
+    if ( !ctx.valid )
+        return;
+
+    if ( ctx.weapon_type < cstypes::weapon_type::pistol ||
+         ctx.weapon_type > cstypes::weapon_type::lmg )
+        return;
+
+    const auto& config = settings::g_combat.m_legitbot.get_group( ctx.weapon_type );
+
+    if ( config.visualize_fov.value )
+    {
+        this->draw_fov(
+            draw_list,
+            this->m_cached_view_angles,
+            this->m_cached_aim_punch,
+            config.fov.value,
+            config.fov_color,
+            config.rcs.value );
+    }
+}
+
+// ─── invalidate_if_needed ─────────────────────────────────────────────────────
+
+void legit::invalidate_if_needed( )
+{
+    const auto local = systems::g_local.get( );
+    if ( !local.is_alive || !local.pawn || !local.controller )
+    {
+        this->m_trigger_release_time  = 0.0f;
+        this->m_trigger_pending_pawn  = 0;
+        this->m_trigger_delay_start   = 0.0f;
+    }
+}
+
+// ─── find_target ──────────────────────────────────────────────────────────────
+
+legit::target_result legit::find_target(
+    const math::vector3&                              shoot_position,
+    const math::vector3&                              view_angles,
+    const settings::combat::legitbot::weapon_group&   config,
+    const systems::local::snapshot&                   local )
+{
+    target_result best{};
+
+    for ( const auto& p : systems::g_entities.get_by_type( systems::entities::type::player ) )
+    {
+        if ( !p.ptr || p.ptr == local.controller )
+            continue;
+
+        if ( !memory::read<bool>( p.ptr + SCHEMA( "CCSPlayerController", "m_bPawnIsAlive"_hash ) ) )
+            continue;
+
+        const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
+        const auto pawn        = systems::g_entities.lookup( pawn_handle );
+
+        if ( !pawn || pawn == local.pawn )
+            continue;
+
+        const auto team = memory::read<std::int32_t>( pawn + SCHEMA( "C_BaseEntity", "m_iTeamNum"_hash ) );
+        if ( !local.is_this_other_team( team ) )
+            continue;
+
+        const auto health = memory::read<std::int32_t>( pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) );
+        if ( health <= 0 )
+            continue;
+
+        if ( memory::read<bool>( pawn + SCHEMA( "C_CSPlayerPawn", "m_bGunGameImmunity"_hash ) ) )
+            continue;
+
+        const auto all_records = g_shared.lc( ).get_valid_records( pawn );
+        if ( all_records.empty( ) )
+            continue;
+
+        std::array<shared::lagcomp::record*, 3> records{ nullptr, nullptr, nullptr };
+        records[ 0 ] = all_records.front( );
+        if ( all_records.size( ) > 2 )
+        {
+            const auto mid = all_records.size( ) / 2;
+            if ( all_records[ mid ] && all_records[ mid ]->valid )
+                records[ 1 ] = all_records[ mid ];
+            if ( all_records.back( ) && all_records.back( )->valid )
+                records[ 2 ] = all_records.back( );
+        }
+        else if ( all_records.size( ) > 1 )
+        {
+            if ( all_records.back( ) && all_records.back( )->valid )
+                records[ 1 ] = all_records.back( );
+        }
+
+        scan_point best_point{};
+        shared::lagcomp::record* best_record{ nullptr };
+
+        for ( const auto record : records )
+        {
+            if ( !record || !record->valid )
+                continue;
+
+            const auto point = this->scan_player( pawn, record, shoot_position, view_angles, config, local );
+            if ( !point.valid )
+                continue;
+
+            if ( !best_record ||
+                 point.damage > best_point.damage ||
+                 ( point.damage == best_point.damage && point.fov < best_point.fov ) )
+            {
+                best_point  = point;
+                best_record = record;
+            }
+        }
+
+        if ( !best_record )
+            continue;
+
+        auto aim_pos = best_point.position;
+        if ( config.target_lead.value > 0 )
+        {
+            const auto vel    = memory::read<math::vector3>( pawn + SCHEMA( "C_BaseEntity", "m_vecAbsVelocity"_hash ) );
+            const auto lead_s = ( static_cast<float>( config.target_lead.value ) / 100.0f ) * 0.12f;
+            aim_pos += vel * lead_s;
+        }
+
+        const auto aim = math::helpers::calculate_angle( shoot_position, aim_pos );
+        const auto fov = math::helpers::angle_distance( view_angles, aim );
+
+        const auto can_kill      = best_point.damage >= static_cast<float>( health );
+        const auto best_can_kill = best.has_target( ) &&
+                                   best.best_point.damage >= static_cast<float>( best.health );
+
+        auto score{ 1000.0f };
+
+        if ( can_kill && !best_can_kill )
+        {
+            score += 50000.0f + best_point.damage * 10.0f + ( 180.0f - fov ) * 5.0f;
+        }
+        else if ( can_kill == best_can_kill )
+        {
+            score += best_point.damage * 60.0f + ( 180.0f - fov ) * 18.0f;
+            if ( best_point.visible )
+                score += 2500.0f;
+            if ( best_point.hitgroup == 1 || best_point.hitbox.index == 0 )
+                score += 1800.0f;
+        }
+        else
+        {
+            continue;
+        }
+
+        if ( pawn == this->m_sticky_pawn )
+        {
+            const auto sticky_fov_factor = std::clamp( 1.0f - ( fov / config.fov.value ), 0.0f, 1.0f );
+            score += ( 4000.0f + static_cast<float>( config.sticky.value ) * 80.0f )
+                    * ( 0.5f + sticky_fov_factor * 0.5f );
+        }
+
+        if ( !best.has_target( ) || score > best.score )
+        {
+            best.pawn       = pawn;
+            best.aim_angle  = aim;
+            best.hitchance  = 1.0f;
+            best.score      = score;
+            best.fov        = fov;
+            best.health     = health;
+            best.record     = best_record;
+            best.best_point = best_point;
+        }
+    }
+
+    return best;
+}
+
+// ─── scan_player ──────────────────────────────────────────────────────────────
+
+legit::scan_point legit::scan_player(
+    std::uintptr_t                                    pawn,
+    shared::lagcomp::record*                          record,
+    const math::vector3&                              shoot_position,
+    const math::vector3&                              view_angles,
+    const settings::combat::legitbot::weapon_group&   config,
+    const systems::local::snapshot&                   local ) const
+{
+    struct hitbox_entry
+    {
+        std::size_t   cfg_index;
+        std::uint32_t bone_id;
+        int           hitgroup;
+    };
+
+    constexpr std::array<hitbox_entry, 7> hitbox_map
+    { {
+        { 0, cstypes::bone_ids::head,           1 },
+        { 1, cstypes::bone_ids::spine_3,        2 },
+        { 2, cstypes::bone_ids::spine_2,        3 },
+        { 3, cstypes::bone_ids::left_shoulder,  4 },
+        { 3, cstypes::bone_ids::right_shoulder, 5 },
+        { 4, cstypes::bone_ids::left_knee,      6 },
+        { 4, cstypes::bone_ids::right_knee,     7 },
+    } };
+
+    const auto pen_ctx  = g_shared.pen( ).prepare_target( pawn, record );
+    const auto skeleton = g_shared.lc( ).get_skeleton( *record );
+
+    scan_point best{};
+    best.fov    = 999.0f;
+    best.damage = -1.0f;
+
+    constexpr float k_offsets[3] = { 0.0f, 0.35f, -0.35f };
+
+    for ( const auto& [ cfg_idx, bone_id, hitgroup ] : hitbox_map )
+    {
+        if ( !config.hitboxes.values[ cfg_idx ] )
+            continue;
+
+        const auto bone_index = static_cast<std::size_t>( bone_id );
+        if ( bone_index >= 27 )
+            continue;
+
+        const auto& bone = skeleton[ bone_index ];
+        if ( bone.position.length_sqr( ) < 1.0f )
+            continue;
+
+        const float capsule_r = ( hitgroup == 1 ) ? 3.8f : 9.5f;
+
+        const auto aim_dir  = ( bone.position - shoot_position ).normalized( );
+        const auto world_up = math::vector3{ 0.0f, 0.0f, 1.0f };
+        auto tangent        = aim_dir.cross( world_up );
+        const auto tlen     = tangent.length( );
+        tangent = ( tlen < 0.001f )
+            ? math::vector3{ 1.0f, 0.0f, 0.0f }
+            : tangent * ( 1.0f / tlen );
+
+        for ( const float offset_t : k_offsets )
+        {
+            const auto sample_pos = bone.position + tangent * ( capsule_r * offset_t );
+
+            const auto aim = math::helpers::calculate_angle( shoot_position, sample_pos );
+            const auto fov = math::helpers::angle_distance( view_angles, aim );
+
+            if ( fov > config.fov.value )
+                continue;
+
+            shared::penetration::result pen{};
+            if ( !g_shared.pen( ).run( shoot_position, sample_pos, pen_ctx, local.pawn, local.team, pen ) )
+                continue;
+
+            const auto visible = !pen.penetrated;
+            if ( !visible && !config.autowall.value )
+                continue;
+
+            if ( !visible && pen.damage < static_cast<float>( config.min_damage.value ) )
+                continue;
+
+            auto is_better = false;
+            if ( !best.valid )
+            {
+                is_better = true;
+            }
+            else
+            {
+                const auto dmg_threshold = best.damage * 0.95f;
+                if ( pen.damage > best.damage )
+                {
+                    is_better = true;
+                }
+                else if ( pen.damage >= dmg_threshold )
+                {
+                    if ( pen.hitgroup > 0 && pen.hitgroup < best.hitgroup )
+                        is_better = true;
+                    else if ( pen.hitgroup == best.hitgroup && fov < best.fov )
+                        is_better = true;
+                }
+            }
+
+            if ( is_better )
+            {
+                best.position   = sample_pos;
+                best.damage     = pen.damage;
+                best.fov        = fov;
+                best.hitgroup   = pen.hitgroup;
+                best.cfg_index  = cfg_idx;
+                best.bone_index = static_cast<int>( bone_index );
+                best.visible    = visible;
+                best.is_center  = ( offset_t == 0.0f );
+                best.valid      = true;
+            }
+        }
+    }
+
+    return best;
+}
+
+// ─── apply_aimbot ─────────────────────────────────────────────────────────────
+// FIX 17: view-supplement is no longer applied via set_view_angles.
+// Instead it accumulates into want_x/want_y alongside the mouse delta.
+// This eliminates the double-correction that was causing shoot-straight-down.
+//
+// FIX 18: clamp_angles() enforces pitch ±89 after every angle modification.
+//
+// FIX 20: want_x/want_y clamped to ±12 degrees as final safety net.
+
+void legit::apply_aimbot(
+    systems::input::usercmd*                          cmd,
+    const target_result&                              tgt,
+    const math::vector3&                              view_angles,
+    const math::vector3&                              aim_punch,
+    const settings::combat::legitbot::weapon_group&   config,
+    const systems::local::snapshot&                   local )
+{
+    auto aim_angle = tgt.aim_angle;
+
+    const auto shots_fired = memory::read<int>( local.pawn + SCHEMA( "C_CSPlayerPawn", "m_iShotsFired"_hash ) );
+
+    // Pre-compute smooth_factor for RCS supplement calculation
+    float smooth_factor = 1.0f;
+
+    if ( config.smooth.value > 0 )
+    {
+        auto delta = aim_angle - view_angles;
+        math::helpers::normalize_angles( delta );
+        const auto delta_length = std::sqrtf( delta.x * delta.x + delta.y * delta.y );
+
+        if ( delta_length >= 0.028f )
+        {
+            const auto t            = std::clamp( delta_length / config.fov.value, 0.0f, 1.0f );
+            const auto ease         = t * t * ( 3.0f - 2.0f * t );
+            const auto decel_factor = 0.08f + ease * 0.72f;
+            const auto base_smooth  = static_cast<float>( std::max( 1, config.smooth.value ) );
+            smooth_factor = std::clamp( decel_factor / ( base_smooth * 0.80f + 0.20f ), 0.018f, 0.88f );
+        }
+    }
+
+    // Smooth only the player's base aim toward the target.  Recoil is applied
+    // after smoothing so a full punch delta is never diluted by aim smoothing.
+    // This keeps the target motion humanized while holding bullet direction.
+    float rcs_supp_x = 0.0f;
+    float rcs_supp_y = 0.0f;
+
+    if ( config.smooth.value > 0 )
+    {
+        auto delta = aim_angle - view_angles;
+        math::helpers::normalize_angles( delta );
+
+        const auto delta_length = std::sqrtf( delta.x * delta.x + delta.y * delta.y );
+        const auto base_smooth = static_cast<float>( std::max( 1, config.smooth.value ) );
+
+        if ( delta_length < 0.028f )
+        {
+            aim_angle = view_angles;
+        }
+        else
+        {
+            const auto t            = std::clamp( delta_length / config.fov.value, 0.0f, 1.0f );
+            const auto ease         = t * t * ( 3.0f - 2.0f * t );
+            const auto decel_factor = 0.08f + ease * 0.72f;
+            smooth_factor           = std::clamp( decel_factor / ( base_smooth * 0.80f + 0.20f ), 0.018f, 0.88f );
+
+            auto move_x = delta.x * smooth_factor;
+            auto move_y = delta.y * smooth_factor * 0.97f;
+
+            if ( config.humanize.value )
+            {
+                this->m_humanize_phase += 0.17f;
+                const auto wobble = ( 1.0f - t ) * 0.012f + t * 0.035f;
+                move_x += std::sinf( this->m_humanize_phase ) * wobble;
+                move_y += std::cosf( this->m_humanize_phase * 0.73f ) * wobble * 0.85f;
+            }
+
+            const auto punch_mag = std::sqrtf( aim_punch.x * aim_punch.x + aim_punch.y * aim_punch.y );
+            const auto heavy_spray = ( shots_fired > 4 && punch_mag > 3.0f );
+
+            if ( !heavy_spray )
+            {
+                const auto jitter_time = static_cast<std::uint32_t>( g_shared.ctx( ).current_time * 31337.0f );
+                const auto u1 = lcg_float( jitter_time ^ 0xDEAD1234u );
+                const auto u2 = lcg_float( jitter_time ^ 0xBEEF5678u );
+                const auto u3 = lcg_float( jitter_time ^ 0xCAFE9ABCu );
+                const auto u4 = lcg_float( jitter_time ^ 0xF00D4321u );
+
+                const auto jitter_scale = ( 0.002f + ( 1.0f - t ) * 0.003f ) * smooth_factor;
+                move_x += gaussian( u1, u2 ) * jitter_scale;
+                move_y += gaussian( u3, u4 ) * jitter_scale * 0.9f;
+            }
+
+            const auto step_len = std::sqrtf( move_x * move_x + move_y * move_y );
+            const auto max_step = std::max( 0.22f, delta_length * 0.48f );
+            if ( step_len > max_step && step_len > 0.0001f )
+            {
+                const auto s = max_step / step_len;
+                move_x *= s;
+                move_y *= s;
+            }
+
+            aim_angle = view_angles + math::vector3{ move_x, move_y, 0.0f };
+            clamp_angles( aim_angle );
+        }
+    }
+
+    // Apply exactly one full, live-punch compensation after the base aim has
+    // been smoothed.  Applying it before smoothing attenuates RCS every tick,
+    // which leaves rifle sprays above the target at range.
+    if ( config.rcs.value )
+        this->apply_rcs( aim_angle, aim_punch, config.rcs_min.value, config.rcs_max.value,
+                         smooth_factor, shots_fired, rcs_supp_x, rcs_supp_y );
+
+    clamp_angles( aim_angle );
+
+    auto want_x = aim_angle.x - view_angles.x;
+    auto want_y = aim_angle.y - view_angles.y;
+    (void)rcs_supp_x;
+    (void)rcs_supp_y;
+
+    // FIX 22: clear remainder if it overflowed (broken accumulation)
+    if ( std::abs( this->m_remainder_x ) > 2.0f ) this->m_remainder_x = 0.0f;
+    if ( std::abs( this->m_remainder_y ) > 2.0f ) this->m_remainder_y = 0.0f;
+
+    want_x += this->m_remainder_x;
+    want_y += this->m_remainder_y;
+
+    // FIX 20: safety clamp — no single tick should move more than 12 degrees
+    want_x = std::clamp( want_x, -12.0f, 12.0f );
+    want_y = std::clamp( want_y, -12.0f, 12.0f );
+
+    const auto sensitivity   = CONVAR ("sensitivity")->get<float>( );
+    const auto fov_adjust    = memory::read<float>( local.pawn + SCHEMA( "C_BasePlayerPawn", "m_flFOVSensitivityAdjust"_hash ) );
+    const auto deg_per_count = sensitivity * 0.022f * fov_adjust;
+
+    // Guard against zero sensitivity (would cause NaN)
+    if ( deg_per_count < 0.0001f )
+        return;
+
+    const auto counts_x = std::roundf( want_x / deg_per_count );
+    const auto counts_y = std::roundf( want_y / deg_per_count );
+
+    this->m_remainder_x = want_x - counts_x * deg_per_count;
+    this->m_remainder_y = want_y - counts_y * deg_per_count;
+
+    systems::g_legit_input.add_mouse_delta( counts_x * deg_per_count, counts_y * deg_per_count );
+}
+
+// ─── apply_triggerbot ─────────────────────────────────────────────────────────
+
+void legit::apply_triggerbot(
+    systems::input::usercmd*                          cmd,
+    const math::vector3&                              shoot_position,
+    const math::vector3&                              view_angles,
+    const math::vector3&                              aim_punch,
+    const settings::combat::legitbot::weapon_group&   config,
+    const systems::local::snapshot&                   local )
+{
+    const auto& ctx      = g_shared.ctx( );
+    const auto seed_mode = config.give_me_your_seed.value;
+
+    if ( this->m_trigger_release_time > 0.0f )
+    {
+        if ( ctx.current_time >= this->m_trigger_release_time )
+        {
+            this->m_trigger_release_time = 0.0f;
+            this->m_trigger_pending_pawn = 0;
+            return;
+        }
+
+        cmd->buttons.value         |= cstypes::command_buttons::in_attack;
+        cmd->buttons.value_changed |= cstypes::command_buttons::in_attack;
+        return;
+    }
+
+    auto corrected_angles = view_angles;
+    if ( config.rcs.value && aim_punch.length_sqr( ) > 0.0001f )
+    {
+        corrected_angles.x += aim_punch.x;
+        corrected_angles.y += aim_punch.y;
+        clamp_angles( corrected_angles ); // FIX 18
+    }
+
+    math::vector3  bullet_dir{};
+    std::uint32_t  seed{};
+    math::vector2  spread{};
+
+    if ( seed_mode )
+    {
+        const auto tick_base = memory::read<std::int32_t>( local.controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) );
+        seed   = g_shared.get_spread_seed( corrected_angles, tick_base );
+        spread = g_shared.calculate_spread( seed, ctx.inaccuracy, ctx.spread, ctx.recoil_index, ctx.item_def_idx, ctx.num_bullets );
+
+        math::vector3 forward{}, left{}, up{};
+        math::helpers::angle_vectors_left( corrected_angles, &forward, &left, &up );
+        bullet_dir = ( forward + left * spread.x + up * spread.y ).normalized( );
+    }
+
+    auto  hit_pawn{ 0ull };
+    shared::penetration::result  pen{};
+    shared::lagcomp::record*     hit_record{ nullptr };
+    auto  found{ false };
+
+    const auto gather_records = [ & ]( std::uintptr_t pawn ) -> std::array<shared::lagcomp::record*, 3>
+    {
+        std::array<shared::lagcomp::record*, 3> out{ nullptr, nullptr, nullptr };
+        const auto records = g_shared.lc( ).get_valid_records( pawn );
+        if ( records.empty( ) || !records.front( ) || !records.front( )->valid )
+            return out;
+
+        out[ 0 ] = records.front( );
+
+        if ( records.size( ) > 2 )
+        {
+            const auto mid = records.size( ) / 2;
+            if ( records[ mid ] && records[ mid ]->valid )
+                out[ 1 ] = records[ mid ];
+            if ( records.back( ) && records.back( )->valid )
+                out[ 2 ] = records.back( );
+        }
+        else if ( records.size( ) > 1 )
+        {
+            if ( records.back( ) && records.back( )->valid )
+                out[ 1 ] = records.back( );
+        }
+
+        return out;
+    };
+
+    for ( const auto& p : systems::g_entities.get_by_type( systems::entities::type::player ) )
+    {
+        if ( !p.ptr || p.ptr == local.controller )
+            continue;
+
+        if ( !memory::read<bool>( p.ptr + SCHEMA( "CCSPlayerController", "m_bPawnIsAlive"_hash ) ) )
+            continue;
+
+        const auto pawn_handle = memory::read<std::uint32_t>( p.ptr + SCHEMA( "CBasePlayerController", "m_hPawn"_hash ) );
+        const auto pawn        = systems::g_entities.lookup( pawn_handle );
+
+        if ( !pawn || pawn == local.pawn )
+            continue;
+
+        const auto team = memory::read<std::int32_t>( pawn + SCHEMA( "C_BaseEntity", "m_iTeamNum"_hash ) );
+        if ( !local.is_this_other_team( team ) )
+            continue;
+
+        const auto health = memory::read<std::int32_t>( pawn + SCHEMA( "C_BaseEntity", "m_iHealth"_hash ) );
+        if ( health <= 0 )
+            continue;
+
+        if ( memory::read<bool>( pawn + SCHEMA( "C_CSPlayerPawn", "m_bGunGameImmunity"_hash ) ) )
+            continue;
+
+        const auto recs = gather_records( pawn );
+        if ( !recs[ 0 ] )
+            continue;
+
+        const auto game_scene_node = memory::read<std::uintptr_t>( pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
+        const auto hitbox_set      = systems::g_hitboxes.query( game_scene_node );
+
+        for ( const auto rec : recs )
+        {
+            if ( !rec )
+                continue;
+
+            const auto skeleton = g_shared.lc( ).get_skeleton( *rec );
+
+            if ( seed_mode )
+            {
+                for ( const auto& hb : hitbox_set )
+                {
+                    if ( hb.bone < 0 || hb.bone >= 28 )
+                        continue;
+
+                    const auto& bone = skeleton[ hb.bone ];
+                    if ( bone.position.length_sqr( ) < 1.0f )
+                        continue;
+
+                    const auto capsule_start = bone.rotation.rotate_vector( hb.mins ) + bone.position;
+                    const auto capsule_end   = bone.rotation.rotate_vector( hb.maxs ) + bone.position;
+                    const auto radius        = hb.radius > 0.0f ? hb.radius * 0.9f : 1.8f;
+
+                    auto fraction{ 1.0f };
+                    if ( !g_shared.ray_vs_capsule( shoot_position, bullet_dir * ctx.range, capsule_start, capsule_end, radius, fraction ) )
+                        continue;
+
+                    const auto hitgroup = systems::g_hitboxes.hitgroup_from_hitbox( hb.index );
+                    if ( config.trigger_head_only.value && hitgroup != 1 )
+                        continue;
+
+                    const auto hit_point = shoot_position + bullet_dir * ctx.range * fraction;
+                    const auto pen_ctx   = g_shared.pen( ).prepare_target( pawn, rec );
+
+                    shared::penetration::result candidate_pen{};
+                    if ( !g_shared.pen( ).run( shoot_position, hit_point, pen_ctx, local.pawn, local.team, candidate_pen ) )
+                        continue;
+
+                    if ( candidate_pen.penetrated && candidate_pen.damage < static_cast<float>( config.min_damage.value ) )
+                        continue;
+
+                    if ( !found || candidate_pen.damage > pen.damage )
+                    {
+                        hit_pawn   = pawn;
+                        hit_record = rec;
+                        pen        = candidate_pen;
+                        found      = true;
+                    }
+
+                    break;
+                }
+            }
+            else
+            {
+                const systems::hitboxes::entry* closest_hb{ nullptr };
+                auto closest_fov{ FLT_MAX };
+
+                for ( const auto& entry : hitbox_set )
+                {
+                    if ( entry.bone < 0 || entry.bone >= 28 )
+                        continue;
+
+                    const auto& bone = skeleton[ entry.bone ];
+                    if ( bone.position.length_sqr( ) < 1.0f )
+                        continue;
+
+                    const auto center = bone.rotation.rotate_vector( ( entry.mins + entry.maxs ) * 0.5f ) + bone.position;
+                    const auto aim    = math::helpers::calculate_angle( shoot_position, center );
+                    const auto fov    = math::helpers::angle_distance( corrected_angles, aim );
+
+                    if ( fov > 2.0f )
+                        continue;
+
+                    if ( fov < closest_fov )
+                    {
+                        closest_fov = fov;
+                        closest_hb  = &entry;
+                    }
+                }
+
+                if ( !closest_hb )
+                    continue;
+
+                const auto& bone        = skeleton[ closest_hb->bone ];
+                const auto target_point = bone.rotation.rotate_vector( ( closest_hb->mins + closest_hb->maxs ) * 0.5f ) + bone.position;
+                const auto pen_ctx      = g_shared.pen( ).prepare_target( pawn, rec );
+
+                shared::penetration::result candidate_pen{};
+                if ( !g_shared.pen( ).run( shoot_position, target_point, pen_ctx, local.pawn, local.team, candidate_pen ) )
+                    continue;
+
+                const auto visible = !candidate_pen.penetrated;
+                if ( !visible )
+                {
+                    if ( !config.autowall.value )
+                        continue;
+                    if ( candidate_pen.damage < static_cast<float>( config.min_damage.value ) )
+                        continue;
+                }
+
+                if ( !found || candidate_pen.damage > pen.damage )
+                {
+                    hit_pawn   = pawn;
+                    hit_record = rec;
+                    pen        = candidate_pen;
+                    found      = true;
+                }
+            }
+        }
+    }
+
+    if ( !found )
+    {
+        this->m_trigger_pending_pawn = 0;
+        return;
+    }
+
+    if ( config.trigger_head_only.value && pen.hitgroup != 1 )
+    {
+        this->m_trigger_pending_pawn = 0;
+        return;
+    }
+
+    if ( pen.penetrated && pen.damage < static_cast<float>( config.min_damage.value ) )
+    {
+        this->m_trigger_pending_pawn = 0;
+        return;
+    }
+
+    if ( !seed_mode )
+    {
+        const auto skeleton        = g_shared.lc( ).get_skeleton( *hit_record );
+        const auto game_scene_node = memory::read<std::uintptr_t>( hit_pawn + SCHEMA( "C_BaseEntity", "m_pGameSceneNode"_hash ) );
+        const auto hitbox_set      = systems::g_hitboxes.query( game_scene_node );
+
+        const systems::hitboxes::entry* best_hb{ nullptr };
+        for ( const auto& entry : hitbox_set )
+        {
+            if ( entry.index == pen.hitbox )
+            {
+                best_hb = &entry;
+                break;
+            }
+        }
+
+        if ( best_hb && best_hb->bone >= 0 && best_hb->bone < 28 )
+        {
+            hit_record->apply( );
+            const auto hc = g_shared.calculate_hitchance(
+                shoot_position,
+                corrected_angles,
+                *best_hb,
+                skeleton[ best_hb->bone ],
+                ctx.inaccuracy,
+                ctx.spread );
+            hit_record->restore( );
+
+            const auto min_hc = static_cast<float>( config.trigger_hitchance.value ) / 100.0f;
+            if ( hc < min_hc && !g_shared.is_max_accuracy( ctx.inaccuracy ) )
+            {
+                this->m_trigger_pending_pawn = 0;
+                return;
+            }
+        }
+
+        const auto delay_ms = static_cast<float>( config.trigger_delay.value );
+
+        if ( this->m_trigger_pending_pawn != hit_pawn )
+        {
+            this->m_trigger_pending_pawn = hit_pawn;
+            this->m_trigger_delay_start  = ctx.current_time;
+        }
+
+        const auto elapsed_ms = ( ctx.current_time - this->m_trigger_delay_start ) * 1000.0f;
+        if ( elapsed_ms < delay_ms )
+            return;
+    }
+
+    g_shared.last_shoot_tick( ) = memory::read<std::int32_t>( local.controller + SCHEMA( "CBasePlayerController", "m_nTickBase"_hash ) );
+
+    const auto record_time        = cstypes::tick_fraction::from_value( hit_record->simulation_time / cstypes::tick_interval );
+    const auto input_history_size = cmd->csgo_user_cmd.input_history_size( );
+    const auto history_angles     = seed_mode
+        ? corrected_angles
+        : math::vector3{ view_angles.x - aim_punch.x, view_angles.y - aim_punch.y, 0.0f };
+
+    for ( auto i = 0; i < input_history_size; ++i )
+    {
+        const auto entry = cmd->csgo_user_cmd.mutable_input_history( i );
+        if ( !entry )
+            continue;
+
+        if ( const auto angles = entry->mutable_view_angles( ) )
+        {
+            angles->set_x( history_angles.x );
+            angles->set_y( history_angles.y );
+        }
+
+        entry->set_render_tick_count( record_time.tick + 1 );
+        entry->set_render_tick_fraction( 0.0f );
+
+        if ( entry->has_sv_interp0( ) )
+        {
+            const auto interp = entry->mutable_sv_interp0( );
+            interp->set_src_tick( -1 );
+            interp->set_dst_tick( -1 );
+            interp->set_frac( 0.0f );
+        }
+
+        if ( entry->has_sv_interp1( ) )
+        {
+            const auto interp = entry->mutable_sv_interp1( );
+            interp->set_src_tick( -1 );
+            interp->set_dst_tick( -1 );
+            interp->set_frac( 0.0f );
+        }
+
+        if ( entry->has_cl_interp( ) )
+            entry->mutable_cl_interp( )->set_frac( 0.0f );
+    }
+
+    cmd->buttons.value         |= cstypes::command_buttons::in_attack;
+    cmd->buttons.value_changed |= cstypes::command_buttons::in_attack;
+
+    if ( input_history_size > 0 )
+        cmd->csgo_user_cmd.set_attack1_start_history_index( input_history_size - 1 );
+
+    this->m_trigger_release_time = ctx.current_time + random::hold_duration( );
+}
+
+// ─── apply_rcs ────────────────────────────────────────────────────────────────
+// FIX 17: no longer calls set_view_angles.
+//   Instead, writes the view supplement into supp_x/supp_y out-params.
+//   The caller (apply_aimbot) adds these to want_x/want_y before the mouse delta.
+//   This eliminates the double-correction that caused shooting straight down.
+//
+// FIX 19: spike guard — spike detection only fires when shots_fired > 1 AND
+//   m_prev_aim_punch was nonzero. First shot after idle had prev=0 which made
+//   any punch look like a spike (0 → 3.5 = delta 3.5 > 0.8 → full 100% correction).
+//
+// FIX 21: signature simplified (no view_angles or local param).
+
+void legit::apply_rcs(
+    math::vector3& aim_angle,
+    const math::vector3& aim_punch,
+    int            rand_min,
+    int            rand_max,
+    float          smooth_factor,
+    int            shots_fired,
+    float&         out_supp_x,
+    float&         out_supp_y )
+{
+    out_supp_x = 0.0f;
+    out_supp_y = 0.0f;
+
+    (void)smooth_factor;
+
+    if ( shots_fired < 1 )
+    {
+        this->m_prev_aim_punch = aim_punch;
+        this->m_old_punch      = aim_punch;
+        return;
+    }
+
+    // Temporary scale probe: one console line for each new shot in a spray.
+    // Compare the live engine value against the project's recoil-pattern
+    // simulation before deciding whether live punch needs an extra scale.
+    static int last_logged_shot = -1;
+    if ( shots_fired != last_logged_shot )
+    {
+        last_logged_shot = shots_fired;
+
+        const auto simulated_punch = g_shared.simulate_aim_punch(
+            g_shared.ctx( ).recoil_index );
+
+        const auto live_magnitude = std::sqrtf(
+            aim_punch.x * aim_punch.x + aim_punch.y * aim_punch.y );
+        const auto simulated_magnitude = std::sqrtf(
+            simulated_punch.x * simulated_punch.x +
+            simulated_punch.y * simulated_punch.y );
+        const auto live_to_simulated = simulated_magnitude > 0.0001f
+            ? live_magnitude / simulated_magnitude
+            : 0.0f;
+
+        logging::console::print(
+            xs( "[rcs-probe] shot={} recoil_index={} live=({:.3f}, {:.3f}) "
+                "simulated=({:.3f}, {:.3f}) live/simulated={:.3f}\\n" ),
+            shots_fired,
+            g_shared.ctx( ).recoil_index,
+            aim_punch.x,
+            aim_punch.y,
+            simulated_punch.x,
+            simulated_punch.y,
+            live_to_simulated );
+    }
+
+    // get_aim_punch is already the shot offset this codebase uses everywhere.
+    // Multiplying by weapon_recoil_scale (2) doubled it and buried the view.
+    // Bake into the aim *target* so the aimbot walks toward (bone - punch)
+    // instead of fighting RCS back up to the raw skull (that's the long-range miss).
+    const auto factor = this->compute_rcs_factor( rand_min, rand_max );
+    aim_angle.x -= aim_punch.x * factor;
+    aim_angle.y -= aim_punch.y * factor;
+    math::helpers::normalize_angles( aim_angle );
+
+    this->m_prev_aim_punch = aim_punch;
+    this->m_old_punch      = aim_punch;
+}
+
+// ─── update_standalone_rcs ────────────────────────────────────────────────────
+// FIX 13: distance-adaptive carry ratio via punch magnitude proxy
+// Standalone RCS is safe to use set_view_angles since aimbot is not active
+// (called only when !locking in on_create_move)
+
+void legit::update_standalone_rcs(
+    const math::vector3&             view_angles,
+    const math::vector3&             aim_punch,
+    int                              amount,
+    int                              rand_min,
+    int                              rand_max,
+    bool                             apply,
+    const systems::local::snapshot&  local )
+{
+    const auto shots_fired = memory::read<int>( local.pawn + SCHEMA( "C_CSPlayerPawn", "m_iShotsFired"_hash ) );
+    if ( shots_fired < 1 )
+    {
+        this->m_old_punch      = aim_punch;
+        this->m_prev_aim_punch = aim_punch;
+        this->m_rcs_carry_x    = 0.0f;
+        this->m_rcs_carry_y    = 0.0f;
+        return;
+    }
+
+    const auto factor = this->compute_rcs_factor( rand_min, rand_max );
+    const auto scale  = static_cast<float>( amount ) / 100.0f;
+    auto dx = ( aim_punch.x - this->m_prev_aim_punch.x ) * factor * scale;
+    auto dy = ( aim_punch.y - this->m_prev_aim_punch.y ) * factor * scale;
+
+    const auto step = std::sqrtf( dx * dx + dy * dy );
+    constexpr float kMaxStep = 4.0f;
+    if ( step > kMaxStep && step > 0.0001f )
+    {
+        const auto s = kMaxStep / step;
+        dx *= s;
+        dy *= s;
+    }
+
+    if ( apply )
+    {
+        auto new_angles = view_angles;
+        new_angles.x -= dx;
+        new_angles.y -= dy;
+        clamp_angles( new_angles );
+        systems::g_input.set_view_angles( new_angles );
+    }
+
+    this->m_old_punch      = aim_punch;
+    this->m_prev_aim_punch = aim_punch;
+}
+
+// ─── compute_rcs_factor ───────────────────────────────────────────────────────
+
+float legit::compute_rcs_factor( int rand_min, int rand_max ) const
+{
+    const auto shots = memory::read<int>(
+        systems::g_local.get( ).pawn + SCHEMA( "C_CSPlayerPawn", "m_iShotsFired"_hash ) );
+    // Stable per shot — time-based seed made the factor flip every tick and
+    // turned delta RCS into a random pitch shove.
+    const auto seed  = static_cast<std::uint32_t>( shots ) * 2654435761u;
+
+    const auto t         = lcg_float( seed );
+    const auto min_scale = static_cast<float>( rand_min ) / 100.0f;
+    const auto max_scale = static_cast<float>( rand_max ) / 100.0f;
+    return min_scale + ( max_scale - min_scale ) * t;
+}
+
+// ─── draw_fov ─────────────────────────────────────────────────────────────────
+
+void legit::draw_fov(
+    xdraw::draw_list&     draw_list,
+    const math::vector3&  view_angles,
+    const math::vector3&  aim_punch,
+    float                 fov_degrees,
+    const config::col&    color,
+    bool                  rcs_active ) const
+{
+    const auto [ screen_w, screen_h ] = xdraw::viewport_size( );
+    const auto sw = static_cast<float>( screen_w );
+    const auto sh = static_cast<float>( screen_h );
+
+    const auto camera_fov_rad = math::helpers::deg_to_rad( systems::g_view.fov( ) );
+    const auto aimbot_fov_rad = math::helpers::deg_to_rad( fov_degrees );
+    const auto radius         = std::tanf( aimbot_fov_rad ) / std::tanf( camera_fov_rad * 0.5f ) * ( sw * 0.5f );
+
+    auto offset_x{ 0.0f };
+    auto offset_y{ 0.0f };
+
+    if ( rcs_active )
+    {
+        const auto punch_magnitude = aim_punch.length_sqr( );
+        const auto current_time    = g_shared.ctx( ).current_time;
+
+        if ( punch_magnitude > 0.5f )
+            this->m_last_significant_punch_time = current_time;
+
+        const auto time_since = current_time - this->m_last_significant_punch_time;
+        if ( time_since < 0.3f && punch_magnitude > 0.01f )
+        {
+            auto corrected = view_angles;
+            corrected.x -= aim_punch.x;
+            corrected.y -= aim_punch.y;
+            clamp_angles( corrected ); // FIX 18
+
+            math::vector3 center_dir{}, corrected_dir{};
+            math::helpers::angle_vectors_left( view_angles, &center_dir );
+            math::helpers::angle_vectors_left( corrected,   &corrected_dir );
+
+            const auto render_origin = systems::g_frame_data.origin( );
+            const auto cs = systems::g_view.project( render_origin + center_dir    * 1000.0f );
+            const auto ns = systems::g_view.project( render_origin + corrected_dir * 1000.0f );
+
+            if ( systems::g_view.projection_valid( cs ) && systems::g_view.projection_valid( ns ) )
+            {
+                offset_x = ( cs.x - ns.x ) * 0.5f;
+                offset_y = ( cs.y - ns.y ) * 0.5f;
+            }
+        }
+    }
+
+    const auto cx = sw * 0.5f + offset_x;
+    const auto cy = sh * 0.5f + offset_y;
+    const auto& c = color.value;
+
+    const auto segments = static_cast<int>( std::clamp( radius * 2.0f, 16.0f, 64.0f ) );
+    draw_list.circle( cx, cy, radius, xdraw::color{ c.r, c.g, c.b, c.a }, 1.5f, segments );
+}
+
+// ─── hitgroup_to_cfg ──────────────────────────────────────────────────────────
+
+int legit::hitgroup_to_cfg( int hitgroup )
+{
+    static constexpr int table[]{ -1, 0, 1, 2, 3, 3, 4, 4 };
+
+    if ( hitgroup < 0 || hitgroup >= static_cast<int>( std::size( table ) ) )
+        return -1;
+
+    return table[ hitgroup ];
+}
+
+} // namespace features::combat

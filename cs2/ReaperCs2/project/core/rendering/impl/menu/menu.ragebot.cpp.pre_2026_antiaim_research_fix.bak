@@ -1,0 +1,230 @@
+#include <pch/pch.hpp>
+#include <core/settings.hpp>
+
+#include "../../rendering.hpp"
+
+namespace rendering {
+
+	namespace detail {
+
+		constexpr const char* hitbox_names[ ]{ "head", "chest", "stomach", "arms", "legs", "feet" };
+
+	} // namespace detail
+
+	void menu::draw_ragebot( float group_w ) const
+	{
+		auto& s = settings::g_combat;
+		auto& rb = s.m_ragebot;
+		auto& qp = s.m_quickpeek;
+		auto& dp = s.m_duckpeek;
+		auto& zb = s.m_zeusbot;
+		auto& kb = s.m_knifebot;
+		auto& autos = s.m_autos;
+		auto& lg = s.m_lagcomp;
+
+		const auto wx = this->m_x;
+		const auto wy = this->m_y;
+		const auto content_x = wx + tokens::gap + tokens::sidebar_w + tokens::gap;
+		const auto body_y = wy + tokens::gap + tokens::subtab_bar_h + tokens::gap;
+		const auto content_w = this->m_w - tokens::gap * 2.0f - tokens::sidebar_w - tokens::gap;
+		const auto col_w = ( content_w - tokens::gap ) * 0.5f;
+		const auto right_x = content_x + col_w + tokens::gap;
+
+		const auto warn_h = 26.0f;
+		{
+			auto& dl = xui::draw::current( );
+			dl.rect_filled( content_x, body_y, content_w, warn_h, xdraw::color{ 160, 18, 28, 200 }, xdraw::corner_radius{ 4.0f } );
+			dl.rect( content_x, body_y, content_w, warn_h, xdraw::color{ 255, 48, 58, 160 }, xdraw::corner_radius{ 4.0f }, 1.0f );
+
+			constexpr auto warn_text = "WARNING - RAGEBOT IS NOT VAC SAFE";
+			const auto [tw, th] = xdraw::measure_text( warn_text );
+			const auto tx = std::floor( content_x + ( content_w - tw ) * 0.5f );
+			const auto ty = std::floor( body_y + ( warn_h - th ) * 0.5f );
+			dl.text( tx, ty, warn_text, xdraw::color{ 255, 92, 92, 255 } );
+		}
+
+		const auto list_y = body_y + warn_h + tokens::gap;
+
+		auto& wg = rb.groups[ this->m_subtab ];
+
+		xui::layout::set_cursor( content_x - wx, list_y - wy );
+
+		if ( xui::begin_child( "##ragebot_aimbot", col_w ) )
+		{
+			xui::checkbox( "enabled", rb.enabled );
+			xui::tooltip( "Global master switch for rage aimbot.\n"
+			              "This setting applies to every weapon group." );
+
+			xui::checkbox( "spinbot", rb.spinbot );
+			xui::tooltip( "Rotates yaw (and optionally pitch) every tick.\n"
+			              "Right-click to set spin speed and pitch direction." );
+			if ( xui::begin_popup( "##spinbot_popup", 220.0f ) )
+			{
+				xui::slider_int( "speed", rb.spin_speed, 1, 64, "%d" );
+				xui::tooltip( "How fast the anti-aim yaw spins per tick.\n"
+				              "Higher = faster rotation." );
+
+				if ( xui::checkbox( "pitch down", rb.spin_pitch_down ) && rb.spin_pitch_down.value )
+				{
+					rb.spin_pitch_up.value = false;
+				}
+				xui::tooltip( "Force pitch to look straight down while spinning." );
+
+				if ( xui::checkbox( "pitch up", rb.spin_pitch_up ) && rb.spin_pitch_up.value )
+				{
+					rb.spin_pitch_down.value = false;
+				}
+				xui::tooltip( "Force pitch to look straight up while spinning." );
+				xui::end_popup( );
+			}
+
+			xui::checkbox( "silent", wg.silent );
+			xui::tooltip( "Aim on the server without moving your view locally.\n"
+			              "Your client camera stays where you left it." );
+
+			xui::checkbox( "no spread", wg.no_spread );
+			xui::tooltip( "Compensate weapon inaccuracy so shots land on\n"
+			              "the predicted path instead of the spread cone.\n"
+			              "This bypasses the regular hitchance and autostop gate." );
+
+			xui::checkbox( "double tap", wg.doubletap );
+			xui::tooltip( "Shift ticks to fire two shots in rapid succession\n"
+			              "when the exploit is charged." );
+
+			xui::checkbox( "force shot in air", wg.force_shot_air );
+			xui::tooltip( "Allow the ragebot to shoot while you are airborne\n"
+			              "even if hitchance would normally block it." );
+
+			xui::checkbox( "force shot on ground", wg.force_shot );
+			xui::tooltip( "Allow a shot below configured hitchance while grounded,\n"
+			              "but only after the weapon reaches maximum accuracy." );
+
+			xui::checkbox( "extrapolation", lg.extrapolation );
+			xui::tooltip( "Predict where the target will be after ping/lerp\n"
+			              "instead of aiming at their last networked pose." );
+			if ( lg.extrapolation.value )
+			{
+				xui::slider_int( "max extrapolate ticks", lg.max_extrapolate_ticks, 1, 32, "%d" );
+				xui::tooltip( "Maximum number of ticks used to predict a target forward." );
+			}
+
+			xui::slider_int( "max backtrack ticks", lg.max_backtrack_ticks, 1, 32, "%d" );
+			xui::tooltip( "Maximum number of historical target records retained for aiming." );
+
+			xui::slider_float( "max fov", wg.max_fov, 1.0f, 180.0f, "%.0f°" );
+			xui::tooltip( "Maximum aim cone in degrees.\n"
+			              "180° includes targets behind you. Lower = tighter selection." );
+
+			xui::slider_int( "hit chance", wg.hitchance, 25, 100, "%d%%" );
+			xui::tooltip( "Minimum predicted hit probability before shooting.\n"
+			              "Accounts for spread, inaccuracy, and movement." );
+
+			xui::slider_int( "min damage", wg.min_damage, 5, 125, "%d" );
+			xui::tooltip( "Do not shoot unless expected damage meets this value.\n"
+			              "Values over 100 are health-relative: 101 = HP + 1." );
+
+			xui::checkbox( "hit chance override", wg.hitchance_override );
+			xui::tooltip( "Temporarily replace hitchance with the popup value\n"
+			              "while the override bind is held. Right-click to set it." );
+			if ( xui::begin_popup( "##hitchance_popup", 220.0f ) )
+			{
+				xui::slider_int( "value##hc", wg.hitchance_override_value, 0, 100, "%d%%" );
+				xui::tooltip( "Hitchance used while the override key is held." );
+				xui::end_popup( );
+			}
+
+			xui::checkbox( "min damage override", wg.min_damage_override );
+			xui::tooltip( "Temporarily replace min damage with the popup value\n"
+			              "while the override bind is held. Right-click to set it." );
+			if ( xui::begin_popup( "##mindamage_popup", 220.0f ) )
+			{
+				xui::slider_int( "value##md", wg.min_damage_override_value, 0, 130, "%d" );
+				xui::tooltip( "Minimum damage used while held. Values over 100\n"
+				              "are health-relative: 125 = HP + 25." );
+				xui::end_popup( );
+			}
+
+			xui::end_child( );
+		}
+
+		if ( xui::begin_child( "##ragebot_extras", col_w, 190.0f, true ) )
+		{
+			xui::checkbox( "force b-aim", wg.body_aim );
+			xui::tooltip( "Exclude the head and scan body hitboxes only." );
+
+			xui::checkbox( "dynamic point scale", wg.dynamic_pointscale );
+			xui::tooltip( "Shrink or grow multipoints based on distance and\n"
+			              "hitbox size instead of using a fixed scale." );
+
+			xui::checkbox( "debug multipoints", wg.debug_multipoints );
+			xui::tooltip( "Draw scanned multipoints in the world for tuning." );
+
+			xui::slider_float( "point scale", wg.pointscale, 0.0f, 100.0f, "%.0f%%" );
+			xui::tooltip( "How far from the hitbox center extra aim points spread.\n"
+			              "0 = center only. 100 = full hitbox coverage." );
+
+			xui::multicombo( "hitboxes", wg.hitboxes, detail::hitbox_names, 6 );
+			xui::tooltip( "Which bones the ragebot is allowed to target." );
+
+			xui::end_child( );
+		}
+
+		xui::layout::set_cursor( right_x - wx, list_y - wy );
+
+		if ( xui::begin_child( "##ragebot_otherbots", col_w ) )
+		{
+			xui::checkbox( "auto revolver", autos.revolver );
+			xui::tooltip( "Automatically cock the R8 so the next click fires\n"
+			              "immediately instead of waiting on the hammer." );
+
+			xui::checkbox( "zeusbot", zb.enabled );
+			xui::tooltip( "Auto-aim and fire the Zeus when a target is in range.\n"
+			              "Right-click for FOV and drop-after settings." );
+			if ( xui::begin_popup( "##zb_settings", 220.0f ) )
+			{
+				xui::slider_float( "max fov##zb", zb.max_fov, 1, 180, "%.0f°" );
+				xui::tooltip( "Maximum angle the Zeusbot will snap within." );
+
+				xui::checkbox( "drop after##zb", zb.drop_after );
+				xui::tooltip( "Drop the Zeus after a successful fire." );
+				xui::end_popup( );
+			}
+
+			xui::checkbox( "knifebot", kb.enabled );
+			xui::tooltip( "Auto-swing the knife when a target is inside FOV.\n"
+			              "Right-click to set the scan cone." );
+			if ( xui::begin_popup( "##kb_settings", 220.0f ) )
+			{
+				xui::slider_float( "max fov##kb", kb.max_fov, 1, 180, "%.0f°" );
+				xui::tooltip( "Maximum angle the knifebot will attack within." );
+				xui::end_popup( );
+			}
+
+			xui::end_child( );
+		}
+
+		if ( xui::begin_child( "##ragebot_peek", col_w ) )
+		{
+			xui::checkbox( "quick peek", qp.enabled );
+			xui::tooltip( "Record your stand position, peek out to shoot,\n"
+			              "then retract automatically. Right-click for colors." );
+			if ( xui::begin_popup( "##qp_colors", 220.0f ) )
+			{
+				xui::color_picker( "base color##qp", qp.color );
+				xui::tooltip( "Color of the quick-peek origin marker." );
+
+				xui::color_picker( "retracting color##qp", qp.retrack_color );
+				xui::tooltip( "Color used while the assist is pulling you back." );
+				xui::end_popup( );
+			}
+
+			xui::checkbox( "duck peek", dp.enabled );
+			xui::tooltip( "Crouch-peek assist that uncrouches to take the shot\n"
+			              "then ducks again." );
+
+			xui::end_child( );
+		}
+
+	}
+
+} // namespace rendering
